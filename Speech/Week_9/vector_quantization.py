@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+## for further efficiency EMA can be implemented for dealign with dead codebook problem but for now Random Awakening is also good solution!
 
 class Perplexity(nn.Module):
     EPS = 1e-8
@@ -62,11 +63,28 @@ class VectorQuantizer(nn.Module):
         assert embeddings.dim() == 4
         B, E, H, W = embeddings.shape
 
-        # [sequence_1, embedding_dim] -> (B*H*W, E)
         embeddings_flat = embeddings.permute(0, 2, 3, 1).contiguous().view(-1, self.embedding_dim)
 
         distances = self.calculate_squared_distances(embeddings_flat, self.codebook.weight)
         indices_flat = torch.argmin(distances, dim=1) # argmin standard
+
+        # --- Random Awakening typa shit
+        if self.training:
+            used_indices = torch.unique(indices_flat)
+            
+            # get ignored ones
+            if len(used_indices) < self.codebook_size:
+                mask = torch.ones(self.codebook_size, dtype=torch.bool, device=embeddings.device)
+                mask[used_indices] = False
+                dead_indices = torch.where(mask)[0]
+                
+                # Randomly sample replacement vectors from the current batch's inputs
+                perm = torch.randperm(embeddings_flat.size(0), device=embeddings.device)
+                num_to_replace = min(len(dead_indices), len(perm))
+                
+                if num_to_replace > 0:
+                    # In-place update of dead codebook weights with active encoded representations
+                    self.codebook.weight.data[dead_indices[:num_to_replace]] = embeddings_flat[perm[:num_to_replace]]
 
         indices = indices_flat.view(B, H, W)
         return indices
