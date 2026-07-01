@@ -26,6 +26,9 @@ class VectorQuantizer(nn.Module):
     def __init__(self, codebook_size, embedding_dim):
         super().__init__()
 
+        self.dead_threshold = 5 # +- right one
+        self.register_buffer('dead_counter', torch.zeros(codebook_size, dtype=torch.long))
+
         self.embedding_dim = embedding_dim
         self.codebook_size = codebook_size
 
@@ -63,28 +66,33 @@ class VectorQuantizer(nn.Module):
         assert embeddings.dim() == 4
         B, E, H, W = embeddings.shape
 
+        # [sequence_1, embedding_dim] -> (B*H*W, E)
         embeddings_flat = embeddings.permute(0, 2, 3, 1).contiguous().view(-1, self.embedding_dim)
 
         distances = self.calculate_squared_distances(embeddings_flat, self.codebook.weight)
         indices_flat = torch.argmin(distances, dim=1) # argmin standard
 
-        # --- Random Awakening typa shit
+        # --- Persistent Random Awakening ---
         if self.training:
             used_indices = torch.unique(indices_flat)
+        
+            self.dead_counter += 1
+            self.dead_counter[used_indices] = 0
             
-            # get ignored ones
-            if len(used_indices) < self.codebook_size:
-                mask = torch.ones(self.codebook_size, dtype=torch.bool, device=embeddings.device)
-                mask[used_indices] = False
-                dead_indices = torch.where(mask)[0]
-                
-                # Randomly sample replacement vectors from the current batch's inputs
+            # 3. Identify vectors that have been dead for longer than the threshold
+            dead_indices = torch.where(self.dead_counter >= self.dead_threshold)[0]
+            
+            if len(dead_indices) > 0:
                 perm = torch.randperm(embeddings_flat.size(0), device=embeddings.device)
                 num_to_replace = min(len(dead_indices), len(perm))
                 
                 if num_to_replace > 0:
-                    # In-place update of dead codebook weights with active encoded representations
-                    self.codebook.weight.data[dead_indices[:num_to_replace]] = embeddings_flat[perm[:num_to_replace]]
+                    # Replace dead vectors with active ones
+                    dead_to_revive = dead_indices[:num_to_replace]
+                    self.codebook.weight.data[dead_to_revive] = embeddings_flat[perm[:num_to_replace]]
+                    
+                    # Reset the counter for the newly awakened vectors
+                    self.dead_counter[dead_to_revive] = 0
 
         indices = indices_flat.view(B, H, W)
         return indices
